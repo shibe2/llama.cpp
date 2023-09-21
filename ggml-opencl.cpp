@@ -730,7 +730,7 @@ __kernel void KERNEL_NAME(__global X_TYPE* x, __global float* y) {
     const uint qk = QUANT_K;
     const uint qr = QUANT_R;
 
-    const int ib = i/qk; // block index
+    const int ib = (i+get_global_offset(0))/qk; // block index
     const int iqs = (i%qk)/qr; // quant index
     const int iybs = i - i%qk; // y block start index
     const int y_offset = qr == 1 ? 1 : qk/2;
@@ -1351,6 +1351,7 @@ static cl_int ggml_cl_h2d_tensor_2d(cl_command_queue queue, cl_mem dst, size_t o
     const size_t bs = ggml_blck_size(type);
 
     const void * x = (const void *) ((const char *) src->data + i2*nb2 + i3*nb3);
+    offset *= ts;
     if (nb0 == ts && nb1 == ts*ne0/bs) {
         err = clEnqueueWriteBuffer(queue, dst, CL_FALSE, offset, ne1*nb1, x, 0, NULL, ev);
         return err;
@@ -1493,16 +1494,20 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
     if (src0->backend == GGML_BACKEND_GPU) { // NOLINT
         d_X = (cl_mem) src0->data;
     } else {
-        d_X = ggml_cl_pool_malloc(sizeof(ggml_fp16_t) * x_ne, &x_size);
+        d_X = ggml_cl_pool_malloc(sizeof(float) * x_ne, &x_size);
     }
     cl_mem d_Y = ggml_cl_pool_malloc(sizeof(float) * y_ne, &y_size);
     cl_mem d_D = ggml_cl_pool_malloc(sizeof(float) * d_ne, &d_size);
+
+    size_t x_offset = 0;
 
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy data to device
             if (src0->backend != GGML_BACKEND_GPU) {
                 CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+            } else {
+                x_offset = (i03 * ne02 + i02) * x_ne;
             }
             CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
 
@@ -1514,7 +1519,7 @@ static void ggml_cl_mul_mat_f32(const ggml_tensor * src0, const ggml_tensor * sr
                                                        clblast::Transpose::kYes, clblast::Transpose::kNo,
                                                        ne01, ne11, ne10,
                                                        alpha,
-                                                       d_X, 0, ne00,
+                                                       d_X, x_offset, ne00,
                                                        d_Y, 0, ne10,
                                                        beta,
                                                        d_D, 0, ne01,
@@ -1577,11 +1582,15 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
     bool src1_cont_rows = nb10 == sizeof(float);
     bool src1_cont_cols = (size_t)nb11 == ne11*sizeof(float);
 
+    size_t x_offset = 0;
+
     for (int64_t i03 = 0; i03 < ne03; i03++) {
         for (int64_t i02 = 0; i02 < ne02; i02++) {
             // copy src0 to device
             if (src0->backend != GGML_BACKEND_GPU) {
                 CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_X, 0, src0, i03, i02, NULL));
+            } else {
+                x_offset = (i03 * ne02 + i02) * x_ne;
             }
 
             // convert src1 to fp16
@@ -1618,7 +1627,7 @@ static void ggml_cl_mul_mat_f16(const ggml_tensor * src0, const ggml_tensor * sr
                                                        clblast::Transpose::kYes, clblast::Transpose::kNo,
                                                        ne01, ne11, ne10,
                                                        alpha,
-                                                       d_X, 0, ne00,
+                                                       d_X, x_offset, ne00,
                                                        d_Y, 0, ne10,
                                                        beta,
                                                        d_D, 0, ne01,
@@ -1720,9 +1729,10 @@ static void ggml_cl_mul_mat_q_f32(const ggml_tensor * src0, const ggml_tensor * 
             } else { // general dequantization kernel + CLBlast matrix matrix multiplication
                 // convert src0 to fp32 on device
                 const size_t global = x_ne / global_denom;
+                const size_t offset = src0->backend == GGML_BACKEND_GPU ? (i03 * ne02 + i02) * global : 0;
                 CL_CHECK(clSetKernelArg(*to_fp32_cl, 0, sizeof(cl_mem), &d_Q));
                 CL_CHECK(clSetKernelArg(*to_fp32_cl, 1, sizeof(cl_mem), &d_X));
-                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, NULL, &global, local > 0 ? &local : NULL, events.size(), !events.empty() ? events.data() : NULL, NULL));
+                CL_CHECK(clEnqueueNDRangeKernel(queue, *to_fp32_cl, 1, offset > 0 ? &offset : NULL, &global, local > 0 ? &local : NULL, events.size(), !events.empty() ? events.data() : NULL, NULL));
 
                 // copy src1 to device
                 CL_CHECK(ggml_cl_h2d_tensor_2d(queue, d_Y, 0, src1, i03, i02, NULL));
